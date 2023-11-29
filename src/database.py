@@ -17,3 +17,11 @@ class MongoDBConnection:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.client.close()
+
+
+def get_topics(db):
+    all_topics = []
+    collection = db["topics"]
+    for doc in collection.find():
+        all_topics.append(doc["topicName"])
+    return all_topics
