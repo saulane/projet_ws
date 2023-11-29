@@ -1,3 +1,4 @@
+import time
 from flask import Flask, request, Response, abort
 from flask.json import jsonify
 from database import MongoDBConnection, get_topics
@@ -5,8 +6,27 @@ import json
 import requests
 from collections import defaultdict
 import logging
+from jsonschema import validate
 
 app = Flask(__name__)
+
+TOPIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string"
+        },
+        "urls": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+            "additionalProperties": False
+        }
+    },
+    "required": ["category", "urls"],
+    "additionalProperties": False
+}
 
 
 logging.basicConfig(
@@ -17,12 +37,21 @@ logging.basicConfig(
 )
 
 def merge_remote(host, port):
-    print("Getting data from:",host,port)
+    logging.info(f"Getting data from {host}:{port}")
     topics = requests.get(f"http://{host}:{port}/ws/topics").json()
-    print(topics)
     if len(topics) == 0:
         return jsonify({"status": 404, "message": "No topics found"})
     for topic in topics:
+        res = requests.get(f"http://{host}:{port}/ws/topic/{topic}").json()
+        resources = [{"category": el, "urls": res[el]} for el in res]
+
+        try:
+            for r in resources:
+                validate(instance=r, schema=TOPIC_SCHEMA)
+        except Exception as e:
+            logging.error(f"Error from {host}:{port}: {e}")
+            break
+    
         with MongoDBConnection() as db:
             if topic not in get_topics(db):
                 logging.info(f"Inserting topic: {topic}")
@@ -30,15 +59,12 @@ def merge_remote(host, port):
                 collection.insert_one({"topicName": topic})
 
 
-        res = requests.get(f"http://{host}:{port}/ws/topic/{topic}").json()
-        resources = [{"category": el, "urls": res[el]} for el in res]
         for category in resources:
             cat = category["category"]
             urls = category["urls"]
             with MongoDBConnection() as db:
                 collection = db["topics"]
                 document = collection.find_one({"topicName": topic})
-                print(urls, cat)
 
                 if 'resources' in document and any(resource['category'] == cat for resource in document['resources']):
                     logging.info(f"Category {cat} already in database")
@@ -56,28 +82,32 @@ def merge_remote(host, port):
 
 @app.before_request
 def auto_populate_annuaire():
-    if request.remote_addr not in ["localhost", "127.0.0.1"]:
-        p = 5000
-        if (
-            requests.get(f"http://{request.remote_addr}:{p}/ws/annuaire").status_code
-            == 200
-        ):
-            with MongoDBConnection() as db:
-                collection = db["annuaire"]
-
-                if collection.find_one({"host": request.remote_addr}) is not None:
-                    logging.info(f"{request.remote_addr}:{p} already in database")
-                    try:
-                        merge_remote(request.remote_addr, p)
-                    except Exception as e:
-                        logging.error(f"Error from {request.remote_addr}:{p}: {e}")
-                else:
-                    try:
-                        collection.insert_one({"host": request.remote_addr, "port": p})
-                        print(f"{request.remote_addr}:{p} added to database")
-                        merge_remote(request.remote_addr, p)
-                    except Exception as e:
-                        logging.error(f"Error from {request.remote_addr}:{p}: {e}")
+    try:
+        if request.remote_addr not in ["localhost", "127.0.0.1"]:
+            p = 5000
+            if (
+                requests.get(f"http://{request.remote_addr}:{p}/ws/annuaire").status_code
+                == 200
+            ):
+                with MongoDBConnection() as db:
+                    collection = db["annuaire"]
+                    server = collection.find_one({"host": request.remote_addr})
+                    if server is not None:
+                        logging.info(f"{request.remote_addr}:{p} already in database")
+                        try:
+                            merge_remote(request.remote_addr, p)
+                        except Exception as e:
+                            logging.error(f"Error from {request.remote_addr}:{p}: {e}")
+                        collection.update_one({"host": request.remote_addr}, {"$set": {"lastVisited": time.time()}}, upsert=True)
+                    else:
+                        try:
+                            collection.insert_one({"host": request.remote_addr, "port": p, "lastVisited": time.time()})
+                            print(f"{request.remote_addr}:{p} added to database")
+                            merge_remote(request.remote_addr, p)
+                        except Exception as e:
+                            logging.error(f"Error from {request.remote_addr}:{p}: {e}")
+    except Exception as e:
+        logging.error(e)
 
 
 @app.route("/ws")
@@ -90,8 +120,10 @@ def update_remote():
     with MongoDBConnection() as db:
         collection = db["annuaire"]
         for doc in collection.find():
-            print(doc)
-            merge_remote(doc["host"], doc["port"])
+            try:
+                merge_remote(doc["host"], doc["port"])
+            except Exception as e:
+                logging.error(f"Error from {doc['host']}:{doc['port']}: {e}")
     return jsonify({"status": 200, "message": "Database updated successfully"})
 
 
